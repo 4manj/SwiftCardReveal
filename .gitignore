@@ -1,0 +1,36 @@
+## macOS
+.DS_Store
+
+## Xcode per-user state
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+
+## Build artifacts
+DerivedData/
+build/
+*.xcarchive
+*.dSYM.zip
+*.dSYM
+
+## Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.pins
+Package.resolved
+
+## CocoaPods / Carthage / fastlane (not used today, future-proofing)
+Pods/
+Carthage/Build/
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+## IDE noise
+.idea/
+.vscode/
+
+## Local Claude Code state
+.claude/
