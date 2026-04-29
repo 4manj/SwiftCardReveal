@@ -1086,13 +1086,16 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         let hasTapped = revealedAt != nil
         let pretapRadiusX: Float = 0.30
         let pretapRadiusY: Float = 0.30
-        let postTapRadius = max(aspect, 1.0) * 1.8
+        // 4.0 pushes the burst expansion well past the visible viewport so
+        // the visible viewport samples only the dense centre of the flower
+        // mask — particles cover the full screen with no visible edge.
+        let postTapRadius = max(aspect, 1.0) * 4.0
 
         let maskRadiusX: Float
         let maskRadiusY: Float
         let edgeGlowStrength: Float
         if hasTapped {
-            let t = simd_clamp(tapTime / 0.85, 0, 1)
+            let t = simd_clamp(tapTime / 1.0, 0, 1)
             let eased = 1 - pow(1 - t, 3)
             maskRadiusX = pretapRadiusX + (postTapRadius - pretapRadiusX) * eased
             maskRadiusY = pretapRadiusY + (postTapRadius - pretapRadiusY) * eased
@@ -1353,7 +1356,7 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         if let rt = revealedAt {
             let since = Float(now - rt)
             let holdEnd: Float = 0.18
-            let fadeDur: Float = 0.55
+            let fadeDur: Float = 1.2
             let progress = max(0, since - holdEnd) / fadeDur
             return max(0, 1 - progress)
         }
