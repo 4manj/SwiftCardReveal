@@ -93,4 +93,9 @@ struct ParticleSystemTests {
         let stride = MemoryLayout<FrameUniforms>.stride
         #expect(stride == 80)
     }
+
+    @Test
+    func cloudUniformsStrideMatchesShader() {
+        #expect(MemoryLayout<CloudUniforms>.stride == 20)
+    }
 }

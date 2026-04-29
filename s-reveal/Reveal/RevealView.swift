@@ -83,12 +83,19 @@ struct RevealView: View {
                     } label: {
                         Text("Skip")
                             .font(.system(size: 15, weight: .medium, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.55))
-                            // Two-stop white halo: tight inner glow + soft
-                            // outer falloff. Kept low-opacity so Skip still
-                            // reads as a secondary action.
-                            .shadow(color: .white.opacity(0.25), radius: 5)
-                            .shadow(color: .white.opacity(0.12), radius: 12)
+                            .foregroundStyle(.white.opacity(0.62))
+                            // Two-stop white halo, slightly hotter than before
+                            // so Skip's glow still reads as a discrete element
+                            // when it sits in front of the bottom cloud's
+                            // pink haze.
+                            .shadow(color: .white.opacity(0.42), radius: 5)
+                            .shadow(color: .white.opacity(0.22), radius: 12)
+                            // Plus-lighter blend: Skip text + halo are added
+                            // on top of whatever is behind, so the bottom
+                            // cloud's pink can never wash the label out — on
+                            // black background (pre-tap) it reads as before.
+                            .compositingGroup()
+                            .blendMode(.plusLighter)
                             .padding(.horizontal, 28)
                             .padding(.vertical, 14)
                             .frame(minWidth: 88, minHeight: 44)
@@ -119,7 +126,13 @@ struct RevealView: View {
 // and the gating of taps. All flow goes through here so the parent View and
 // the Metal Coordinator share the same `revealed` flag.
 
+@MainActor
 final class RevealOrchestrator: ObservableObject {
+    struct Timing {
+        var showButtonsDelay: Duration = .seconds(2)
+        var showSkipDelay: Duration = .seconds(2.5)
+    }
+
     @Published var revealed: Bool = false
     @Published var showButtons: Bool = false
     @Published var showSkip: Bool = false
@@ -127,6 +140,13 @@ final class RevealOrchestrator: ObservableObject {
     /// Optional second renderer that draws a petal cohort *in front* of the
     /// SwiftUI card. Same simulation, different seed, transparent drawable.
     weak var foregroundRenderer: ParticleRenderer?
+    private let timing: Timing
+    private var showButtonsTask: Task<Void, Never>?
+    private var showSkipTask: Task<Void, Never>?
+
+    init(timing: Timing = Timing()) {
+        self.timing = timing
+    }
 
     func handleTap(at viewLocation: CGPoint, in viewSize: CGSize) {
         triggerReveal(at: viewLocation, in: viewSize)
@@ -146,6 +166,7 @@ final class RevealOrchestrator: ObservableObject {
         guard let renderer = renderer else { return }
         // Already revealed (or petal animation in flight): no-op.
         guard !revealed, !renderer.isAnimatingPetals else { return }
+        cancelPendingRevealTasks()
 
         renderer.registerTap(viewLocation: viewLocation, viewSize: viewSize)
         // Foreground layer fires a second cohort with haptics suppressed —
@@ -162,18 +183,18 @@ final class RevealOrchestrator: ObservableObject {
 
         // Share buttons fade up 2 s after the reveal completes — gives the
         // card pop + petals time to play before the secondary UI lands.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            withAnimation(.bouncy(duration: 0.55, extraBounce: 0.06)) {
-                self?.showButtons = true
-            }
+        showButtonsTask = Task { [weak self, delay = timing.showButtonsDelay] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            await self?.revealButtons()
         }
 
         // Skip text fades in 0.5 s after the share button — last element to
         // arrive on screen.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-            withAnimation(.smooth(duration: 0.35)) {
-                self?.showSkip = true
-            }
+        showSkipTask = Task { [weak self, delay = timing.showSkipDelay] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            await self?.revealSkip()
         }
     }
 
@@ -182,6 +203,7 @@ final class RevealOrchestrator: ObservableObject {
     /// un-pauses); the orchestrator clears the SwiftUI flags. The user is
     /// back at the "Closing your position…" label, ready to tap again.
     func reset() {
+        cancelPendingRevealTasks()
         renderer?.resetToInitial()
         foregroundRenderer?.resetToInitial()
         withAnimation(.smooth(duration: 0.35)) {
@@ -190,6 +212,47 @@ final class RevealOrchestrator: ObservableObject {
             showSkip = false
         }
     }
+
+    private func cancelPendingRevealTasks() {
+        showButtonsTask?.cancel()
+        showSkipTask?.cancel()
+        showButtonsTask = nil
+        showSkipTask = nil
+    }
+
+    private func revealButtons() {
+        withAnimation(.bouncy(duration: 0.55, extraBounce: 0.06)) {
+            showButtons = true
+        }
+        showButtonsTask = nil
+    }
+
+    private func revealSkip() {
+        withAnimation(.smooth(duration: 0.35)) {
+            showSkip = true
+        }
+        showSkipTask = nil
+    }
+
+#if DEBUG
+    func triggerRevealForTesting() {
+        guard !revealed else { return }
+        cancelPendingRevealTasks()
+        withAnimation(.bouncy(duration: 0.55, extraBounce: 0.12)) {
+            revealed = true
+        }
+        showButtonsTask = Task { [weak self, delay = timing.showButtonsDelay] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            await self?.revealButtons()
+        }
+        showSkipTask = Task { [weak self, delay = timing.showSkipDelay] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            await self?.revealSkip()
+        }
+    }
+#endif
 }
 
 // MARK: - Platform bridge
@@ -284,6 +347,7 @@ extension MetalRevealView {
 
 // MARK: - Coordinator
 
+@MainActor
 final class RevealCoordinator: NSObject {
     let orchestrator: RevealOrchestrator
     var renderer: ParticleRenderer?            // strong — keeps renderer alive

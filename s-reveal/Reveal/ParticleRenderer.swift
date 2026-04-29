@@ -335,6 +335,7 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
     private var rescalePipeline: MTLComputePipelineState!
     private var simulatePetalsPipeline: MTLComputePipelineState!
     private var particleColorPipeline: MTLRenderPipelineState!
+    private var cloudPipeline: MTLRenderPipelineState!
     private var compositePipeline: MTLRenderPipelineState!
     private var downsamplePipeline: MTLRenderPipelineState!
     private var petalRenderPipeline: MTLRenderPipelineState!
@@ -343,6 +344,7 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
 
     private var particleBuffer: MTLBuffer!
     private var uniformBuffer: MTLBuffer!
+    private var cloudUniformBuffer: MTLBuffer!
     private var particleCountBuffer: MTLBuffer!
 
     // Petal confetti buffers
@@ -361,8 +363,10 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
     // MARK: - Textures
 
     private var particleColorTexture: MTLTexture?  // full-res, cleared each frame
+    private var cloudColorTexture: MTLTexture?     // full-res, procedural cloud
     private var bloomDownsampled: MTLTexture?      // quarter-res
     private var bloomBlurred: MTLTexture?          // quarter-res
+    private var cloudBloomBlurred: MTLTexture?     // quarter-res
     private var maskShapeTexture: MTLTexture!
 
     // MARK: - State
@@ -379,8 +383,7 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
     /// Set when the user taps, used to drive the post-tap dust fade-out.
     private var revealedAt: CFTimeInterval?
 
-    /// Weak handle on the MTKView so we can pause it when there's nothing to
-    /// render (dust faded + no petals) and unpause on tap.
+    /// Weak handle on the MTKView for lifecycle coordination.
     private weak var hostView: MTKView?
 
     /// True when this renderer feeds the transparent overlay above the card.
@@ -394,14 +397,9 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
     /// confetti density.
     private let petalCount: Int
 
-    // MARK: - Bloom (lazy — MPS allocation isn't free)
+    // MARK: - Bloom
 
-    private lazy var gaussianBlur: MPSImageGaussianBlur = {
-        // Source-space target ≈ 6 px; bloom textures are 1/4 res, so divide.
-        let blur = MPSImageGaussianBlur(device: device, sigma: 1.5)
-        blur.edgeMode = .clamp
-        return blur
-    }()
+    private let gaussianBlur: MPSImageGaussianBlur
 
     // MARK: - Init
 
@@ -416,6 +414,9 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         self.commandQueue = queue
         self.library = library
         self.drawablePixelFormat = view.colorPixelFormat
+        let blur = MPSImageGaussianBlur(device: device, sigma: 1.5)
+        blur.edgeMode = .clamp
+        self.gaussianBlur = blur
         self.params = SimulationParameters.recommended()
         self.hostView = view
         self.isForegroundLayer = isForegroundLayer
@@ -428,6 +429,9 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
             buildBuffers()
             try loadMaskShapeTexture()
             try loadPetalAtlas()
+            // Keep renderer-local warm-up non-blocking; SplashView kicks off a
+            // process-level prewarm earlier so this usually just tops up cache.
+            prewarmPipelines()
         } catch {
             print("[ParticleRenderer] init failed: \(error)")
             return nil
@@ -439,6 +443,8 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
                "Particle stride changed; update Common.h to match.")
         assert(MemoryLayout<FrameUniforms>.stride == 80,
                "FrameUniforms stride changed; update Common.h to match.")
+        assert(MemoryLayout<CloudUniforms>.stride == 20,
+               "CloudUniforms stride changed; update Common.h to match.")
         assert(MemoryLayout<Petal>.stride == 56,
                "Petal stride changed; update Common.h to match.")
         assert(MemoryLayout<PetalUniforms>.stride == 48,
@@ -489,6 +495,15 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
             label: "ParticleColor"
         )
 
+        // Cloud renders into a half-float intermediate so the wide gaussian
+        // gradients survive without 8-bit banding before final composite.
+        let cloudDesc = MTLRenderPipelineDescriptor()
+        cloudDesc.label = "Cloud"
+        cloudDesc.vertexFunction = library.makeFunction(name: "fullscreenVertex")
+        cloudDesc.fragmentFunction = library.makeFunction(name: "cloudFragment")
+        cloudDesc.colorAttachments[0].pixelFormat = .rgba16Float
+        cloudPipeline = try device.makeRenderPipelineState(descriptor: cloudDesc)
+
         // Composite (no blending, writes opaque to drawable)
         let compositeDesc = MTLRenderPipelineDescriptor()
         compositeDesc.label = "Composite"
@@ -497,12 +512,14 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         compositeDesc.colorAttachments[0].pixelFormat = drawablePixelFormat
         compositePipeline = try device.makeRenderPipelineState(descriptor: compositeDesc)
 
-        // Downsample (used to feed bloom)
+        // Downsample (used to feed bloom). Output format must match the
+        // bloom intermediates above — fp16 to avoid banding on big soft
+        // gradients before MPS blurs them.
         let downsampleDesc = MTLRenderPipelineDescriptor()
         downsampleDesc.label = "Downsample"
         downsampleDesc.vertexFunction = library.makeFunction(name: "fullscreenVertex")
         downsampleDesc.fragmentFunction = library.makeFunction(name: "downsampleFragment")
-        downsampleDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        downsampleDesc.colorAttachments[0].pixelFormat = .rgba16Float
         downsamplePipeline = try device.makeRenderPipelineState(descriptor: downsampleDesc)
     }
 
@@ -539,6 +556,12 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
             options: .storageModeShared
         )!
         uniformBuffer.label = "Uniforms"
+
+        cloudUniformBuffer = device.makeBuffer(
+            length: MemoryLayout<CloudUniforms>.stride,
+            options: .storageModeShared
+        )!
+        cloudUniformBuffer.label = "CloudUniforms"
 
         var count: UInt32 = UInt32(params.particleCount)
         particleCountBuffer = device.makeBuffer(
@@ -608,6 +631,264 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         maskShapeTexture.label = "MaskShape"
     }
 
+    private func prewarmPipelines() {
+        let warmParticleBuffer = device.makeBuffer(
+            length: params.particleCount * MemoryLayout<Particle>.stride,
+            options: .storageModeShared
+        )
+        let warmUniformBuffer = device.makeBuffer(
+            length: MemoryLayout<FrameUniforms>.stride,
+            options: .storageModeShared
+        )
+        let warmCloudUniformBuffer = device.makeBuffer(
+            length: MemoryLayout<CloudUniforms>.stride,
+            options: .storageModeShared
+        )
+        let warmPetalBuffer = device.makeBuffer(
+            length: petalCount * MemoryLayout<Petal>.stride,
+            options: .storageModeShared
+        )
+        let warmPetalUniformBuffer = device.makeBuffer(
+            length: MemoryLayout<PetalUniforms>.stride,
+            options: .storageModeShared
+        )
+
+        guard let warmParticleBuffer,
+              let warmUniformBuffer,
+              let warmCloudUniformBuffer,
+              let warmPetalBuffer,
+              let warmPetalUniformBuffer else {
+            return
+        }
+
+        seedParticles(into: warmParticleBuffer)
+
+        let particleWarm = isForegroundLayer ? nil : makeRenderTarget(
+                format: .bgra8Unorm,
+                width: 4,
+                height: 4,
+                usage: [.renderTarget, .shaderRead],
+                label: "PrewarmParticle"
+              )
+        let cloudWarm = isForegroundLayer ? nil : makeRenderTarget(
+                format: .rgba16Float,
+                width: 4,
+                height: 4,
+                usage: [.renderTarget, .shaderRead],
+                label: "PrewarmCloud"
+              )
+        let bloomWarmA = isForegroundLayer ? nil : makeRenderTarget(
+                format: .rgba16Float,
+                width: 4,
+                height: 4,
+                usage: [.renderTarget, .shaderRead, .shaderWrite],
+                label: "PrewarmBloomA"
+              )
+        let bloomWarmB = isForegroundLayer ? nil : makeRenderTarget(
+                format: .rgba16Float,
+                width: 4,
+                height: 4,
+                usage: [.renderTarget, .shaderRead, .shaderWrite],
+                label: "PrewarmBloomB"
+              )
+        let compositeWarm = isForegroundLayer ? nil : makeRenderTarget(
+                format: drawablePixelFormat,
+                width: 4,
+                height: 4,
+                usage: [.renderTarget, .shaderRead],
+                label: "PrewarmComposite"
+              )
+
+        guard (isForegroundLayer || (particleWarm != nil && cloudWarm != nil && bloomWarmA != nil && bloomWarmB != nil && compositeWarm != nil)),
+              let cb = commandQueue.makeCommandBuffer() else {
+            return
+        }
+
+        cb.label = "RendererPrewarm"
+
+        let warmUniforms = FrameUniforms(
+            tapPos: .zero,
+            time: 0,
+            dt: 1.0 / 60.0,
+            aspect: 1,
+            noiseScale: params.noiseScale,
+            idleStrength: params.idleStrength,
+            upwardFlowSpeed: params.upwardFlowSpeed,
+            bloomIntensity: params.bloomIntensity,
+            dustOpacity: 1,
+            maskCenterY: 0.05,
+            maskRadiusX: 0.30,
+            maskRadiusY: 0.30,
+            maskFeather: 0.42,
+            edgeGlowStrength: 0,
+            tapTime: 0.25,
+            burstEnvelope: 0.8,
+            pad0: 0,
+            pad1: 0
+        )
+        warmUniformBuffer.contents().copyMemory(
+            from: [warmUniforms],
+            byteCount: MemoryLayout<FrameUniforms>.stride
+        )
+
+        let warmCloudUniforms = CloudUniforms(
+            time: 0,
+            aspect: 1,
+            opacity: 1,
+            bloomIntensity: 1,
+            splitProgress: 0.6
+        )
+        warmCloudUniformBuffer.contents().copyMemory(
+            from: [warmCloudUniforms],
+            byteCount: MemoryLayout<CloudUniforms>.stride
+        )
+
+        let warmPetals = PetalSystem.makePetals(at: .zero, seed: 1, count: petalCount)
+        warmPetalBuffer.contents().copyMemory(
+            from: warmPetals,
+            byteCount: warmPetals.count * MemoryLayout<Petal>.stride
+        )
+        let warmPetalUniforms = PetalUniforms(
+            _unusedOrigin: .zero,
+            elapsed: 0.3,
+            dt: 1.0 / 60.0,
+            aspect: 1,
+            gravity: 4.4,
+            dragPerFrame: 0.992,
+            fallDragPerFrame: 0.985,
+            flutterBoost: 4.5,
+            totalCount: UInt32(petalCount),
+            sizeMul: isForegroundLayer ? 1.35 : 1.0,
+            flipX: isForegroundLayer ? -1.0 : 1.0
+        )
+        warmPetalUniformBuffer.contents().copyMemory(
+            from: [warmPetalUniforms],
+            byteCount: MemoryLayout<PetalUniforms>.stride
+        )
+
+        if !isForegroundLayer, let enc = cb.makeComputeCommandEncoder() {
+            enc.label = "PrewarmSimulate"
+            enc.setComputePipelineState(simulatePipeline)
+            enc.setBuffer(warmParticleBuffer, offset: 0, index: 0)
+            enc.setBuffer(warmUniformBuffer, offset: 0, index: 1)
+            enc.setBuffer(particleCountBuffer, offset: 0, index: 2)
+            let tew = simulatePipeline.threadExecutionWidth
+            enc.dispatchThreads(
+                MTLSize(width: params.particleCount, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tew, height: 1, depth: 1)
+            )
+            enc.endEncoding()
+        }
+
+        if !isForegroundLayer, let enc = cb.makeComputeCommandEncoder() {
+            enc.label = "PrewarmRescale"
+            var scale: Float = 1
+            var count = UInt32(params.particleCount)
+            enc.setComputePipelineState(rescalePipeline)
+            enc.setBuffer(warmParticleBuffer, offset: 0, index: 0)
+            enc.setBytes(&scale, length: MemoryLayout<Float>.size, index: 1)
+            enc.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 2)
+            let tew = rescalePipeline.threadExecutionWidth
+            enc.dispatchThreads(
+                MTLSize(width: params.particleCount, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tew, height: 1, depth: 1)
+            )
+            enc.endEncoding()
+        }
+
+        if let enc = cb.makeComputeCommandEncoder() {
+            enc.label = "PrewarmPetals"
+            enc.setComputePipelineState(simulatePetalsPipeline)
+            enc.setBuffer(warmPetalBuffer, offset: 0, index: 0)
+            enc.setBuffer(warmPetalUniformBuffer, offset: 0, index: 1)
+            let tew = simulatePetalsPipeline.threadExecutionWidth
+            enc.dispatchThreads(
+                MTLSize(width: petalCount, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tew, height: 1, depth: 1)
+            )
+            enc.endEncoding()
+        }
+
+        if !isForegroundLayer,
+           let particleWarm,
+           let cloudWarm,
+           let bloomWarmA,
+           let bloomWarmB,
+           let compositeWarm {
+            encodeParticlePass(
+                into: cb,
+                target: particleWarm,
+                pipeline: particleColorPipeline,
+                label: "PrewarmParticleColor",
+                loadAction: .clear,
+                particleBuffer: warmParticleBuffer,
+                uniformBuffer: warmUniformBuffer
+            )
+            encodeCloudPass(
+                into: cb,
+                target: cloudWarm,
+                uniformBuffer: warmCloudUniformBuffer
+            )
+            encodeDownsample(into: cb, source: particleWarm, target: bloomWarmA)
+            gaussianBlur.encode(commandBuffer: cb, sourceTexture: bloomWarmA, destinationTexture: bloomWarmB)
+            encodeDownsample(into: cb, source: cloudWarm, target: bloomWarmA)
+            gaussianBlur.encode(commandBuffer: cb, sourceTexture: bloomWarmA, destinationTexture: bloomWarmB)
+
+            let compositeDesc = MTLRenderPassDescriptor()
+            let compositeAttachment = compositeDesc.colorAttachments[0]!
+            compositeAttachment.texture = compositeWarm
+            compositeAttachment.loadAction = .clear
+            compositeAttachment.storeAction = .store
+            compositeAttachment.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+
+            if let enc = cb.makeRenderCommandEncoder(descriptor: compositeDesc) {
+                enc.label = "PrewarmComposite"
+                enc.setRenderPipelineState(compositePipeline)
+                enc.setFragmentTexture(particleWarm, index: 0)
+                enc.setFragmentTexture(bloomWarmB, index: 1)
+                enc.setFragmentTexture(cloudWarm, index: 2)
+                enc.setFragmentTexture(bloomWarmB, index: 3)
+                enc.setFragmentBuffer(warmUniformBuffer, offset: 0, index: 0)
+                enc.setFragmentBuffer(warmCloudUniformBuffer, offset: 0, index: 1)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+
+                enc.setRenderPipelineState(petalRenderPipeline)
+                enc.setVertexBuffer(warmPetalBuffer, offset: 0, index: 0)
+                enc.setVertexBuffer(warmPetalUniformBuffer, offset: 0, index: 1)
+                enc.setFragmentTexture(petalAtlasTexture, index: 0)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6, instanceCount: petalCount)
+                enc.endEncoding()
+            }
+        } else {
+            let desc = MTLRenderPassDescriptor()
+            let attachment = desc.colorAttachments[0]!
+            attachment.texture = hostView?.currentDrawable?.texture
+            attachment.loadAction = .dontCare
+            attachment.storeAction = .dontCare
+            if attachment.texture == nil,
+               let scratch = makeRenderTarget(
+                format: drawablePixelFormat,
+                width: 4,
+                height: 4,
+                usage: [.renderTarget],
+                label: "PrewarmForeground"
+               ) {
+                attachment.texture = scratch
+            }
+            if let enc = attachment.texture.flatMap({ _ in cb.makeRenderCommandEncoder(descriptor: desc) }) {
+                enc.label = "PrewarmForegroundPetals"
+                enc.setRenderPipelineState(petalRenderPipeline)
+                enc.setVertexBuffer(warmPetalBuffer, offset: 0, index: 0)
+                enc.setVertexBuffer(warmPetalUniformBuffer, offset: 0, index: 1)
+                enc.setFragmentTexture(petalAtlasTexture, index: 0)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6, instanceCount: petalCount)
+                enc.endEncoding()
+            }
+        }
+
+        cb.commit()
+    }
+
     // MARK: - Resize
 
     private func rebuildOffscreenTextures(drawableSize size: CGSize) {
@@ -615,19 +896,36 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         let w = max(1, Int(size.width))
         let h = max(1, Int(size.height))
 
+        if isForegroundLayer {
+            particleColorTexture = nil
+            cloudColorTexture = nil
+            bloomDownsampled = nil
+            bloomBlurred = nil
+            cloudBloomBlurred = nil
+            return
+        }
+
         particleColorTexture = makeRenderTarget(
             format: .bgra8Unorm, width: w, height: h,
             usage: [.renderTarget, .shaderRead], label: "ParticleColor")
+        cloudColorTexture = makeRenderTarget(
+            format: .rgba16Float, width: w, height: h,
+            usage: [.renderTarget, .shaderRead], label: "CloudColor")
 
         let bw = max(1, w / 4)
         let bh = max(1, h / 4)
+        // Half-float bloom intermediates: fp16 preserves the wide
+        // low-frequency gaussian gradients without 8-bit banding when
+        // the cloud lights up large areas of the screen.
         bloomDownsampled = makeRenderTarget(
-            format: .bgra8Unorm, width: bw, height: bh,
+            format: .rgba16Float, width: bw, height: bh,
             usage: [.renderTarget, .shaderRead, .shaderWrite], label: "BloomDownsampled")
         bloomBlurred = makeRenderTarget(
-            format: .bgra8Unorm, width: bw, height: bh,
+            format: .rgba16Float, width: bw, height: bh,
             usage: [.renderTarget, .shaderRead, .shaderWrite], label: "BloomBlurred")
-
+        cloudBloomBlurred = makeRenderTarget(
+            format: .rgba16Float, width: bw, height: bh,
+            usage: [.renderTarget, .shaderRead, .shaderWrite], label: "CloudBloomBlurred")
     }
 
     private func makeRenderTarget(format: MTLPixelFormat,
@@ -671,7 +969,6 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         )
         petalStartTime = CACurrentMediaTime()
         if revealedAt == nil { revealedAt = CACurrentMediaTime() }
-        // Wake the renderer if it had paused itself after the previous burst.
         hostView?.isPaused = false
 
         #if os(iOS)
@@ -685,13 +982,10 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         #endif
     }
 
-    func resetReveal() {
-    }
-
     /// Restore the pre-tap state — dust comes back to full opacity, any
     /// in-flight petal burst stops, the reveal mask is cleared, and the
     /// renderer un-pauses so it can redraw the dust-only scene immediately.
-    /// Used by the Skip button.
+    /// Used by the Skip button. Snaps instantly with no fade.
     func resetToInitial() {
         #if os(iOS)
         // Cut the haptic tail before the visual reset so they finish together.
@@ -746,10 +1040,20 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
     func draw(in view: MTKView) {
         guard let drawable = view.currentDrawable,
               let renderPassDesc = view.currentRenderPassDescriptor,
-              let particleColor = particleColorTexture,
-              let bloomA = bloomDownsampled,
-              let bloomB = bloomBlurred,
               let cb = commandQueue.makeCommandBuffer() else {
+            return
+        }
+        let particleColor = particleColorTexture
+        let cloudColor = cloudColorTexture
+        let bloomA = bloomDownsampled
+        let bloomB = bloomBlurred
+        let cloudBloomB = cloudBloomBlurred
+        let compositeParticleColor: MTLTexture?
+        let compositeCloudColor: MTLTexture?
+        let compositeBloomB: MTLTexture?
+        let compositeCloudBloomB: MTLTexture?
+        if !isForegroundLayer,
+           (particleColor == nil || cloudColor == nil || bloomA == nil || bloomB == nil || cloudBloomB == nil) {
             return
         }
         cb.label = "Frame"
@@ -794,23 +1098,25 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
             burstEnvelope = 0
         }
 
-        // Dust fades out shortly after the tap so the SwiftUI card overlay
-        // can take over the screen cleanly. Hold full for 0.18s after tap
-        // (the dramatic burst moment), then linear-fade over 0.55s.
-        let dustOpacity: Float
-        if let rt = revealedAt {
-            let since = Float(now - rt)
-            let holdEnd: Float = 0.18
-            let fadeDur: Float = 0.55
-            let progress = max(0, since - holdEnd) / fadeDur
-            dustOpacity = max(0, 1 - progress)
-        } else {
-            dustOpacity = 1
-        }
+        let dustOpacity = currentDustOpacity(at: now)
 
         let bloomIntensity: Float = hasTapped
             ? params.bloomIntensity * (1.15 + 0.55 * (1.0 - Self.smoothstep(0.45, 1.2, tapTime)))
             : params.bloomIntensity * 1.05
+        // Cloud arrives in sync with the SwiftUI card pop (≤ 0.55 s) and is
+        // fully visible by 0.35 s — earlier and faster than the old 0.20–0.72
+        // s ramp so the user sees the cloud forming as the card rises.
+        let cloudOpacity: Float = hasTapped
+            ? Self.smoothstep(0.05, 0.35, tapTime)
+            : 0
+        // Split ramps from 0 (centered cloud) to 1 (small top + small bottom,
+        // clear middle). Targets completion at ~1.85 s so the split lands a
+        // hair before the share button appears at 2.0 s — the cloud has
+        // finished separating by the time the secondary UI arrives.
+        let cloudSplitProgress: Float = hasTapped
+            ? Self.smoothstep(0.10, 1.85, tapTime)
+            : 0
+        let cloudBloomIntensity: Float = 1.08 + 0.24 * sin(Float(now - startTime) * 0.62)
 
         let uniforms = FrameUniforms(
             tapPos:         tapPos,
@@ -836,11 +1142,29 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
             from: [uniforms],
             byteCount: MemoryLayout<FrameUniforms>.stride
         )
+        let cloudUniforms = CloudUniforms(
+            time: Float(now - startTime),
+            aspect: aspect,
+            opacity: cloudOpacity,
+            bloomIntensity: cloudBloomIntensity,
+            splitProgress: cloudSplitProgress
+        )
+        cloudUniformBuffer.contents().copyMemory(
+            from: [cloudUniforms],
+            byteCount: MemoryLayout<CloudUniforms>.stride
+        )
 
         // ----- Dust pipeline (background layer only) -----
         // Foreground renderer only produces the petal overlay above the card,
         // so we skip dust simulate / particle pass / bloom entirely there.
         if !isForegroundLayer {
+            guard let particleColor, let cloudColor, let bloomA, let bloomB, let cloudBloomB else {
+                return
+            }
+            compositeParticleColor = particleColor
+            compositeCloudColor = cloudColor
+            compositeBloomB = bloomB
+            compositeCloudBloomB = cloudBloomB
             // ----- 1. Compute simulate -----
             if let enc = cb.makeComputeCommandEncoder() {
                 enc.label = "Simulate"
@@ -864,16 +1188,24 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
                                pipeline: particleColorPipeline,
                                label: "ParticleColor",
                                loadAction: .clear)
+            if cloudOpacity > 0.001 {
+                encodeCloudPass(into: cb, target: cloudColor)
+            }
 
             // ----- 3. Bloom: downsample → MPS Gaussian blur -----
-            // Skip entirely when dust is faded — composite multiplies the bloom
-            // sample by `dustOpacity` so a stale/zero texture is fine. Bloom +
-            // MPS blur is one of the heaviest passes; gating it off saves real
-            // GPU time post-tap once everything has settled.
             if dustOpacity > 0.01 {
                 encodeDownsample(into: cb, source: particleColor, target: bloomA)
                 gaussianBlur.encode(commandBuffer: cb, sourceTexture: bloomA, destinationTexture: bloomB)
             }
+            if cloudOpacity > 0.001 {
+                encodeDownsample(into: cb, source: cloudColor, target: bloomA)
+                gaussianBlur.encode(commandBuffer: cb, sourceTexture: bloomA, destinationTexture: cloudBloomB)
+            }
+        } else {
+            compositeParticleColor = nil
+            compositeCloudColor = nil
+            compositeBloomB = nil
+            compositeCloudBloomB = nil
         }
 
         // ----- 4. Petal confetti simulate (only while a burst is active) -----
@@ -907,7 +1239,7 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
             // dt so per-second damping rescales consistently.
             let petalDt = dt * PetalSystem.timeScale
             let petalUniforms = PetalUniforms(
-                origin:           tapPos,
+                _unusedOrigin:    tapPos,
                 elapsed:          petalElapsed * PetalSystem.timeScale,
                 dt:               petalDt,
                 aspect:           aspect,
@@ -950,10 +1282,20 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
             enc.label = isForegroundLayer ? "ForegroundPetals" : "Composite"
 
             if !isForegroundLayer {
+                guard let compositeParticleColor,
+                      let compositeCloudColor,
+                      let compositeBloomB,
+                      let compositeCloudBloomB else {
+                    enc.endEncoding()
+                    return
+                }
                 enc.setRenderPipelineState(compositePipeline)
-                enc.setFragmentTexture(particleColor, index: 0)
-                enc.setFragmentTexture(bloomB, index: 1)
+                enc.setFragmentTexture(compositeParticleColor, index: 0)
+                enc.setFragmentTexture(compositeBloomB, index: 1)
+                enc.setFragmentTexture(compositeCloudColor, index: 2)
+                enc.setFragmentTexture(compositeCloudBloomB, index: 3)
                 enc.setFragmentBuffer(uniformBuffer, offset: 0, index: 0)
+                enc.setFragmentBuffer(cloudUniformBuffer, offset: 0, index: 1)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             }
 
@@ -977,12 +1319,24 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         cb.present(drawable)
         cb.commit()
 
-        // Pause the MTKView once dust is fully faded and no petals are
-        // animating — Metal has nothing to draw, no reason to keep ticking
-        // at full frame rate. `registerTap` re-enables on the next tap.
-        if dustOpacity <= 0.001, !petalActive {
+        if isForegroundLayer {
+            if !petalActive {
+                hostView?.isPaused = true
+            }
+        } else if dustOpacity <= 0.001 && !petalActive && cloudOpacity <= 0.001 {
             hostView?.isPaused = true
         }
+    }
+
+    private func currentDustOpacity(at now: CFTimeInterval) -> Float {
+        if let rt = revealedAt {
+            let since = Float(now - rt)
+            let holdEnd: Float = 0.18
+            let fadeDur: Float = 0.55
+            let progress = max(0, since - holdEnd) / fadeDur
+            return max(0, 1 - progress)
+        }
+        return 1
     }
 
     // MARK: - Pass helpers
@@ -991,7 +1345,9 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
                                     target: MTLTexture,
                                     pipeline: MTLRenderPipelineState,
                                     label: String,
-                                    loadAction: MTLLoadAction) {
+                                    loadAction: MTLLoadAction,
+                                    particleBuffer: MTLBuffer? = nil,
+                                    uniformBuffer: MTLBuffer? = nil) {
         let desc = MTLRenderPassDescriptor()
         let att = desc.colorAttachments[0]!
         att.texture = target
@@ -1002,10 +1358,10 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         guard let enc = cb.makeRenderCommandEncoder(descriptor: desc) else { return }
         enc.label = label
         enc.setRenderPipelineState(pipeline)
-        enc.setVertexBuffer(particleBuffer, offset: 0, index: 0)
-        enc.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
+        enc.setVertexBuffer(particleBuffer ?? self.particleBuffer, offset: 0, index: 0)
+        enc.setVertexBuffer(uniformBuffer ?? self.uniformBuffer, offset: 0, index: 1)
         enc.setFragmentTexture(maskShapeTexture, index: 0)
-        enc.setFragmentBuffer(uniformBuffer, offset: 0, index: 0)
+        enc.setFragmentBuffer(uniformBuffer ?? self.uniformBuffer, offset: 0, index: 0)
         enc.drawPrimitives(type: .point, vertexStart: 0, vertexCount: params.particleCount)
         enc.endEncoding()
     }
@@ -1027,10 +1383,454 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         enc.endEncoding()
     }
 
+    private func encodeCloudPass(into cb: MTLCommandBuffer,
+                                 target: MTLTexture,
+                                 uniformBuffer: MTLBuffer? = nil) {
+        let desc = MTLRenderPassDescriptor()
+        let att = desc.colorAttachments[0]!
+        att.texture = target
+        att.loadAction = .clear
+        att.storeAction = .store
+        att.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: desc) else { return }
+        enc.label = "Cloud"
+        enc.setRenderPipelineState(cloudPipeline)
+        enc.setFragmentBuffer(uniformBuffer ?? cloudUniformBuffer, offset: 0, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc.endEncoding()
+    }
+
     // MARK: - Errors
 
     enum RendererError: Error {
         case missingFunction(String)
         case artGenerationFailed
+    }
+}
+
+enum MetalPipelinePrewarmer {
+    private static var hasStarted = false
+
+    static func prewarm() {
+        guard !hasStarted else { return }
+        hasStarted = true
+
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue(),
+              let library = device.makeDefaultLibrary(),
+              let particleBuffer = device.makeBuffer(
+                length: SimulationParameters.recommended().particleCount * MemoryLayout<Particle>.stride,
+                options: .storageModeShared
+              ),
+              let uniformBuffer = device.makeBuffer(
+                length: MemoryLayout<FrameUniforms>.stride,
+                options: .storageModeShared
+              ),
+              let cloudUniformBuffer = device.makeBuffer(
+                length: MemoryLayout<CloudUniforms>.stride,
+                options: .storageModeShared
+              ),
+              let petalBuffer = device.makeBuffer(
+                length: PetalSystem.count * MemoryLayout<Petal>.stride,
+                options: .storageModeShared
+              ),
+              let petalUniformBuffer = device.makeBuffer(
+                length: MemoryLayout<PetalUniforms>.stride,
+                options: .storageModeShared
+              ),
+              let particleTexture = makeRenderTarget(device: device, format: .bgra8Unorm, label: "SplashPrewarmParticle"),
+              let cloudTexture = makeRenderTarget(device: device, format: .rgba16Float, label: "SplashPrewarmCloud"),
+              let bloomTextureA = makeRenderTarget(device: device, format: .rgba16Float, label: "SplashPrewarmBloomA"),
+              let bloomTextureB = makeRenderTarget(device: device, format: .rgba16Float, label: "SplashPrewarmBloomB"),
+              let compositeTexture = makeRenderTarget(device: device, format: .bgra8Unorm, label: "SplashPrewarmComposite"),
+              let cb = queue.makeCommandBuffer() else {
+            return
+        }
+
+        let params = SimulationParameters.recommended()
+        let particles = ParticleSystem.makeInitialParticles(
+            count: params.particleCount,
+            seed: 0xC0FFEE_BABE,
+            aspect: 1,
+            params: params
+        )
+        particleBuffer.contents().copyMemory(
+            from: particles,
+            byteCount: particles.count * MemoryLayout<Particle>.stride
+        )
+        let frameUniforms = FrameUniforms(
+            tapPos: .zero,
+            time: 0,
+            dt: 1.0 / 60.0,
+            aspect: 1,
+            noiseScale: params.noiseScale,
+            idleStrength: params.idleStrength,
+            upwardFlowSpeed: params.upwardFlowSpeed,
+            bloomIntensity: params.bloomIntensity,
+            dustOpacity: 1,
+            maskCenterY: 0.05,
+            maskRadiusX: 0.30,
+            maskRadiusY: 0.30,
+            maskFeather: 0.42,
+            edgeGlowStrength: 0,
+            tapTime: 0.25,
+            burstEnvelope: 0.8,
+            pad0: 0,
+            pad1: 0
+        )
+        uniformBuffer.contents().copyMemory(
+            from: [frameUniforms],
+            byteCount: MemoryLayout<FrameUniforms>.stride
+        )
+        let cloudUniforms = CloudUniforms(
+            time: 0,
+            aspect: 1,
+            opacity: 1,
+            bloomIntensity: 1,
+            splitProgress: 0.6
+        )
+        cloudUniformBuffer.contents().copyMemory(
+            from: [cloudUniforms],
+            byteCount: MemoryLayout<CloudUniforms>.stride
+        )
+        let petals = PetalSystem.makePetals(at: .zero, seed: 1)
+        petalBuffer.contents().copyMemory(
+            from: petals,
+            byteCount: petals.count * MemoryLayout<Petal>.stride
+        )
+        let petalUniforms = PetalUniforms(
+            _unusedOrigin: .zero,
+            elapsed: 0.3,
+            dt: 1.0 / 60.0,
+            aspect: 1,
+            gravity: 4.4,
+            dragPerFrame: 0.992,
+            fallDragPerFrame: 0.985,
+            flutterBoost: 4.5,
+            totalCount: UInt32(PetalSystem.count),
+            sizeMul: 1.0,
+            flipX: 1.0
+        )
+        petalUniformBuffer.contents().copyMemory(
+            from: [petalUniforms],
+            byteCount: MemoryLayout<PetalUniforms>.stride
+        )
+
+        guard let simulate = try? computePipeline(device: device, library: library, name: "simulateParticles"),
+              let rescale = try? computePipeline(device: device, library: library, name: "rescaleParticlesX"),
+              let simulatePetals = try? computePipeline(device: device, library: library, name: "simulatePetals"),
+              let cloudPipeline = try? renderPipeline(device: device, library: library, vertex: "fullscreenVertex", fragment: "cloudFragment", pixelFormat: .rgba16Float, label: "SplashPrewarmCloud"),
+              let compositePipeline = try? renderPipeline(device: device, library: library, vertex: "fullscreenVertex", fragment: "compositeFragment", pixelFormat: .bgra8Unorm, label: "SplashPrewarmComposite"),
+              let downsamplePipeline = try? renderPipeline(device: device, library: library, vertex: "fullscreenVertex", fragment: "downsampleFragment", pixelFormat: .rgba16Float, label: "SplashPrewarmDownsample"),
+              let particlePipeline = try? additivePipeline(device: device, library: library, vertex: "particleVertex", fragment: "particleFragment", pixelFormat: .bgra8Unorm, label: "SplashPrewarmParticle"),
+              let petalPipeline = try? petalPipeline(device: device, library: library, pixelFormat: .bgra8Unorm),
+              let maskTexture = makeSolidMaskTexture(device: device),
+              let petalAtlas = makeSolidPetalAtlas(device: device) else {
+            return
+        }
+
+        let blur = MPSImageGaussianBlur(device: device, sigma: 1.5)
+        blur.edgeMode = .clamp
+        cb.label = "SplashMetalPrewarm"
+
+        if let enc = cb.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(simulate)
+            enc.setBuffer(particleBuffer, offset: 0, index: 0)
+            enc.setBuffer(uniformBuffer, offset: 0, index: 1)
+            var count = UInt32(params.particleCount)
+            enc.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 2)
+            let tew = simulate.threadExecutionWidth
+            enc.dispatchThreads(
+                MTLSize(width: params.particleCount, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tew, height: 1, depth: 1)
+            )
+            enc.endEncoding()
+        }
+        if let enc = cb.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(rescale)
+            enc.setBuffer(particleBuffer, offset: 0, index: 0)
+            var scale: Float = 1
+            var count = UInt32(params.particleCount)
+            enc.setBytes(&scale, length: MemoryLayout<Float>.size, index: 1)
+            enc.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 2)
+            let tew = rescale.threadExecutionWidth
+            enc.dispatchThreads(
+                MTLSize(width: params.particleCount, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tew, height: 1, depth: 1)
+            )
+            enc.endEncoding()
+        }
+        if let enc = cb.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(simulatePetals)
+            enc.setBuffer(petalBuffer, offset: 0, index: 0)
+            enc.setBuffer(petalUniformBuffer, offset: 0, index: 1)
+            let tew = simulatePetals.threadExecutionWidth
+            enc.dispatchThreads(
+                MTLSize(width: PetalSystem.count, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tew, height: 1, depth: 1)
+            )
+            enc.endEncoding()
+        }
+
+        encodeParticlePass(
+            commandBuffer: cb,
+            target: particleTexture,
+            pipeline: particlePipeline,
+            particleBuffer: particleBuffer,
+            uniformBuffer: uniformBuffer,
+            maskTexture: maskTexture,
+            vertexCount: params.particleCount
+        )
+        encodeCloudPass(
+            commandBuffer: cb,
+            target: cloudTexture,
+            pipeline: cloudPipeline,
+            uniformBuffer: cloudUniformBuffer
+        )
+        encodeDownsample(commandBuffer: cb, source: particleTexture, target: bloomTextureA, pipeline: downsamplePipeline)
+        blur.encode(commandBuffer: cb, sourceTexture: bloomTextureA, destinationTexture: bloomTextureB)
+        encodeDownsample(commandBuffer: cb, source: cloudTexture, target: bloomTextureA, pipeline: downsamplePipeline)
+        blur.encode(commandBuffer: cb, sourceTexture: bloomTextureA, destinationTexture: bloomTextureB)
+        encodeCompositePass(
+            commandBuffer: cb,
+            target: compositeTexture,
+            pipeline: compositePipeline,
+            particleTexture: particleTexture,
+            bloomTexture: bloomTextureB,
+            cloudTexture: cloudTexture,
+            cloudBloomTexture: bloomTextureB,
+            uniformBuffer: uniformBuffer,
+            cloudUniformBuffer: cloudUniformBuffer
+        )
+        encodePetalPass(
+            commandBuffer: cb,
+            target: compositeTexture,
+            pipeline: petalPipeline,
+            petalBuffer: petalBuffer,
+            petalUniformBuffer: petalUniformBuffer,
+            petalAtlas: petalAtlas
+        )
+
+        cb.commit()
+    }
+
+    private static func computePipeline(device: MTLDevice, library: MTLLibrary, name: String) throws -> MTLComputePipelineState {
+        guard let function = library.makeFunction(name: name) else {
+            throw ParticleRenderer.RendererError.missingFunction(name)
+        }
+        return try device.makeComputePipelineState(function: function)
+    }
+
+    private static func renderPipeline(device: MTLDevice,
+                                       library: MTLLibrary,
+                                       vertex: String,
+                                       fragment: String,
+                                       pixelFormat: MTLPixelFormat,
+                                       label: String) throws -> MTLRenderPipelineState {
+        let desc = MTLRenderPipelineDescriptor()
+        desc.label = label
+        desc.vertexFunction = library.makeFunction(name: vertex)
+        desc.fragmentFunction = library.makeFunction(name: fragment)
+        desc.colorAttachments[0].pixelFormat = pixelFormat
+        return try device.makeRenderPipelineState(descriptor: desc)
+    }
+
+    private static func additivePipeline(device: MTLDevice,
+                                         library: MTLLibrary,
+                                         vertex: String,
+                                         fragment: String,
+                                         pixelFormat: MTLPixelFormat,
+                                         label: String) throws -> MTLRenderPipelineState {
+        let desc = MTLRenderPipelineDescriptor()
+        desc.label = label
+        desc.vertexFunction = library.makeFunction(name: vertex)
+        desc.fragmentFunction = library.makeFunction(name: fragment)
+        let attachment = desc.colorAttachments[0]!
+        attachment.pixelFormat = pixelFormat
+        attachment.isBlendingEnabled = true
+        attachment.rgbBlendOperation = .add
+        attachment.alphaBlendOperation = .add
+        attachment.sourceRGBBlendFactor = .one
+        attachment.destinationRGBBlendFactor = .one
+        attachment.sourceAlphaBlendFactor = .one
+        attachment.destinationAlphaBlendFactor = .one
+        return try device.makeRenderPipelineState(descriptor: desc)
+    }
+
+    private static func petalPipeline(device: MTLDevice,
+                                      library: MTLLibrary,
+                                      pixelFormat: MTLPixelFormat) throws -> MTLRenderPipelineState {
+        let desc = MTLRenderPipelineDescriptor()
+        desc.label = "SplashPrewarmPetals"
+        desc.vertexFunction = library.makeFunction(name: "petalVertex")
+        desc.fragmentFunction = library.makeFunction(name: "petalFragment")
+        let attachment = desc.colorAttachments[0]!
+        attachment.pixelFormat = pixelFormat
+        attachment.isBlendingEnabled = true
+        attachment.rgbBlendOperation = .add
+        attachment.alphaBlendOperation = .add
+        attachment.sourceRGBBlendFactor = .one
+        attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        attachment.sourceAlphaBlendFactor = .one
+        attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        return try device.makeRenderPipelineState(descriptor: desc)
+    }
+
+    private static func makeRenderTarget(device: MTLDevice,
+                                         format: MTLPixelFormat,
+                                         label: String) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: format,
+            width: 4,
+            height: 4,
+            mipmapped: false
+        )
+        desc.usage = [.renderTarget, .shaderRead, .shaderWrite]
+        desc.storageMode = .private
+        let texture = device.makeTexture(descriptor: desc)
+        texture?.label = label
+        return texture
+    }
+
+    private static func makeSolidMaskTexture(device: MTLDevice) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r8Unorm,
+            width: 4,
+            height: 4,
+            mipmapped: false
+        )
+        desc.usage = [.shaderRead]
+        let texture = device.makeTexture(descriptor: desc)
+        var bytes = [UInt8](repeating: 255, count: 16)
+        texture?.replace(
+            region: MTLRegionMake2D(0, 0, 4, 4),
+            mipmapLevel: 0,
+            withBytes: &bytes,
+            bytesPerRow: 4
+        )
+        return texture
+    }
+
+    private static func makeSolidPetalAtlas(device: MTLDevice) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: 12,
+            height: 4,
+            mipmapped: false
+        )
+        desc.usage = [.shaderRead]
+        let texture = device.makeTexture(descriptor: desc)
+        var bytes = [UInt8](repeating: 255, count: 12 * 4 * 4)
+        texture?.replace(
+            region: MTLRegionMake2D(0, 0, 12, 4),
+            mipmapLevel: 0,
+            withBytes: &bytes,
+            bytesPerRow: 12 * 4
+        )
+        return texture
+    }
+
+    private static func encodeParticlePass(commandBuffer cb: MTLCommandBuffer,
+                                           target: MTLTexture,
+                                           pipeline: MTLRenderPipelineState,
+                                           particleBuffer: MTLBuffer,
+                                           uniformBuffer: MTLBuffer,
+                                           maskTexture: MTLTexture,
+                                           vertexCount: Int) {
+        let desc = MTLRenderPassDescriptor()
+        let attachment = desc.colorAttachments[0]!
+        attachment.texture = target
+        attachment.loadAction = .clear
+        attachment.storeAction = .store
+        attachment.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: desc) else { return }
+        enc.setRenderPipelineState(pipeline)
+        enc.setVertexBuffer(particleBuffer, offset: 0, index: 0)
+        enc.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
+        enc.setFragmentTexture(maskTexture, index: 0)
+        enc.setFragmentBuffer(uniformBuffer, offset: 0, index: 0)
+        enc.drawPrimitives(type: .point, vertexStart: 0, vertexCount: vertexCount)
+        enc.endEncoding()
+    }
+
+    private static func encodeCloudPass(commandBuffer cb: MTLCommandBuffer,
+                                        target: MTLTexture,
+                                        pipeline: MTLRenderPipelineState,
+                                        uniformBuffer: MTLBuffer) {
+        let desc = MTLRenderPassDescriptor()
+        let attachment = desc.colorAttachments[0]!
+        attachment.texture = target
+        attachment.loadAction = .clear
+        attachment.storeAction = .store
+        attachment.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: desc) else { return }
+        enc.setRenderPipelineState(pipeline)
+        enc.setFragmentBuffer(uniformBuffer, offset: 0, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc.endEncoding()
+    }
+
+    private static func encodeDownsample(commandBuffer cb: MTLCommandBuffer,
+                                         source: MTLTexture,
+                                         target: MTLTexture,
+                                         pipeline: MTLRenderPipelineState) {
+        let desc = MTLRenderPassDescriptor()
+        let attachment = desc.colorAttachments[0]!
+        attachment.texture = target
+        attachment.loadAction = .dontCare
+        attachment.storeAction = .store
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: desc) else { return }
+        enc.setRenderPipelineState(pipeline)
+        enc.setFragmentTexture(source, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc.endEncoding()
+    }
+
+    private static func encodeCompositePass(commandBuffer cb: MTLCommandBuffer,
+                                            target: MTLTexture,
+                                            pipeline: MTLRenderPipelineState,
+                                            particleTexture: MTLTexture,
+                                            bloomTexture: MTLTexture,
+                                            cloudTexture: MTLTexture,
+                                            cloudBloomTexture: MTLTexture,
+                                            uniformBuffer: MTLBuffer,
+                                            cloudUniformBuffer: MTLBuffer) {
+        let desc = MTLRenderPassDescriptor()
+        let attachment = desc.colorAttachments[0]!
+        attachment.texture = target
+        attachment.loadAction = .clear
+        attachment.storeAction = .store
+        attachment.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: desc) else { return }
+        enc.setRenderPipelineState(pipeline)
+        enc.setFragmentTexture(particleTexture, index: 0)
+        enc.setFragmentTexture(bloomTexture, index: 1)
+        enc.setFragmentTexture(cloudTexture, index: 2)
+        enc.setFragmentTexture(cloudBloomTexture, index: 3)
+        enc.setFragmentBuffer(uniformBuffer, offset: 0, index: 0)
+        enc.setFragmentBuffer(cloudUniformBuffer, offset: 0, index: 1)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc.endEncoding()
+    }
+
+    private static func encodePetalPass(commandBuffer cb: MTLCommandBuffer,
+                                        target: MTLTexture,
+                                        pipeline: MTLRenderPipelineState,
+                                        petalBuffer: MTLBuffer,
+                                        petalUniformBuffer: MTLBuffer,
+                                        petalAtlas: MTLTexture) {
+        let desc = MTLRenderPassDescriptor()
+        let attachment = desc.colorAttachments[0]!
+        attachment.texture = target
+        attachment.loadAction = .load
+        attachment.storeAction = .store
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: desc) else { return }
+        enc.setRenderPipelineState(pipeline)
+        enc.setVertexBuffer(petalBuffer, offset: 0, index: 0)
+        enc.setVertexBuffer(petalUniformBuffer, offset: 0, index: 1)
+        enc.setFragmentTexture(petalAtlas, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6, instanceCount: PetalSystem.count)
+        enc.endEncoding()
     }
 }

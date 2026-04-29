@@ -166,20 +166,6 @@ final class CardMotionModel {
 
     // MARK: - Helpers
 
-    private func hash(_ x: CGFloat) -> CGFloat {
-        let s = sin(x * 127.1 + 311.7) * 43758.5453123
-        return s - floor(s)
-    }
-
-    private func smoothNoise(_ t: CGFloat, seed: CGFloat) -> CGFloat {
-        let i = floor(t)
-        let f = t - i
-        let u = f * f * (3 - 2 * f)
-        let a = hash(i + seed)
-        let b = hash(i + 1 + seed)
-        return ((a + (b - a) * u) * 2) - 1
-    }
-
     private func sign(_ x: CGFloat) -> CGFloat { x < 0 ? -1 : 1 }
     private func clamp(_ v: CGFloat, _ lo: CGFloat, _ hi: CGFloat) -> CGFloat { min(max(v, lo), hi) }
     private func clamp(_ v: TimeInterval, _ lo: TimeInterval, _ hi: TimeInterval) -> TimeInterval { min(max(v, lo), hi) }

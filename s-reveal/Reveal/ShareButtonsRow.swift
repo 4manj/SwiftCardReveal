@@ -10,14 +10,15 @@ import UIKit
 #endif
 
 /// Single pill-shaped Share button shown below the card 2 seconds after the
-/// reveal. On iOS we prebuild the share controller so the tap only has to
-/// present it; macOS keeps the simpler `ShareLink` fallback.
+/// reveal. iOS preloads the bundle JPG into a decoded `UIImage` and presents
+/// `UIActivityViewController` directly via the topmost view controller — no
+/// SwiftUI representable bridge, no async file-rep copy on tap.
+/// macOS keeps the simpler `ShareLink` fallback.
 
 struct ShareButtonsRow: View {
     #if os(iOS)
-    @State private var preparedShareSheet: PreparedShareSheet?
-    @State private var sharePresentationID: UInt = 0
-    @State private var lastTapStartedAt: CFAbsoluteTime = 0
+    @State private var preloadedImage: UIImage?
+    @State private var preparedShareController: UIActivityViewController?
     #else
     /// Pre-decoded share-sheet thumbnail for the macOS `ShareLink` fallback.
     @State private var preview: Image = Self.fallbackPreview
@@ -29,15 +30,8 @@ struct ShareButtonsRow: View {
             label
         }
         .buttonStyle(GlassPressStyle())
-        .background(
-            PreparedShareSheetPresenter(
-                controller: preparedShareSheet?.controller,
-                presentationID: sharePresentationID,
-                tapStartedAt: lastTapStartedAt
-            )
-        )
         .task(priority: .userInitiated) {
-            await warmShareSheetIfNeeded()
+            await preloadImageIfNeeded()
         }
         #else
         ShareLink(
@@ -50,23 +44,7 @@ struct ShareButtonsRow: View {
             label
         }
         .buttonStyle(GlassPressStyle())
-        .simultaneousGesture(
-            // .simultaneousGesture so it doesn't intercept the ShareLink's
-            // own tap recognition; just fires haptic alongside.
-            TapGesture().onEnded {
-                #if os(iOS)
-                // Centralized warm Core Haptics engine. Cold-starting a fresh
-                // UIImpactFeedbackGenerator on each tap added perceptible
-                // latency before the share sheet animation began.
-                RevealHaptics.shared.playCardPress()
-                #endif
-            }
-        )
         .task(priority: .userInitiated) {
-            // Warm the shareItem static + pre-decode the preview thumbnail
-            // before the user can plausibly tap. ShareButtonsRow only mounts
-            // 2 s after the reveal (RevealOrchestrator.showButtons), so this
-            // task always wins the race.
             _ = Self.shareItem
             if let warmed = await Self.decodeThumbnail() {
                 preview = warmed
@@ -117,34 +95,21 @@ struct ShareButtonsRow: View {
             .shadow(color: .pink.opacity(0.10), radius: 20, x: 0, y: 14)
     }
 
-    private static let shareImageURL: URL = {
+    // MARK: - macOS share payload (unchanged ShareLink path)
+
+    #if os(macOS)
+    private static let shareItem: PnlCardImage = {
         let url = Bundle.main.url(forResource: "pnl-card", withExtension: "jpg")
             ?? Bundle.main.bundleURL
-        return url
-    }()
-
-    /// Transferable wrapper around the bundled card JPG. Sharing a bare `URL`
-    /// got the file-style preview row; declaring an explicit `.jpeg`
-    /// `FileRepresentation` is what tells iOS "this is photo data" and
-    /// triggers the tall image preview header at the top of the share sheet —
-    /// the same one Photos.app shows.
-    private static let shareItem: PnlCardImage = {
-        let url = shareImageURL
         return PnlCardImage(url: url)
     }()
 
-    /// Off-main-thread thumbnail decode. Uses ImageIO's thumbnail path with
-    /// `kCGImageSourceShouldCacheImmediately` so the bitmap is fully decoded
-    /// before it ever reaches SwiftUI — no lazy decompression on tap.
-    /// 512 px is well above what the share sheet thumbnail renders at, but
-    /// keeps the bitmap small enough to decode in well under 50 ms.
     private static func decodeThumbnail() async -> Image? {
         await Task.detached(priority: .userInitiated) {
             guard
                 let url = Bundle.main.url(forResource: "pnl-card", withExtension: "jpg"),
                 let src = CGImageSourceCreateWithURL(url as CFURL, nil)
             else { return nil }
-
             let options: [CFString: Any] = [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceShouldCacheImmediately: true,
@@ -154,106 +119,172 @@ struct ShareButtonsRow: View {
             guard
                 let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, options as CFDictionary)
             else { return nil }
-
-            #if os(macOS)
             return Image(nsImage: NSImage(cgImage: cg, size: .zero))
-            #else
-            return Image(uiImage: UIImage(cgImage: cg))
-            #endif
         }.value
     }
 
     private static let fallbackPreview = Image(systemName: "rectangle.on.rectangle.angled")
+    #endif
+
+    // MARK: - iOS preload + present
 
     #if os(iOS)
-    private func handleShareTap() {
-        RevealHaptics.shared.playCardPress()
-
-        let tapStartedAt = CFAbsoluteTimeGetCurrent()
-        lastTapStartedAt = tapStartedAt
-        Self.log("tap -> haptic fired")
-
-        if preparedShareSheet == nil {
-            let buildStartedAt = CFAbsoluteTimeGetCurrent()
-            preparedShareSheet = Self.makePreparedShareSheet()
-            Self.logDuration(
-                "tap fallback build",
-                since: buildStartedAt
-            )
+    @MainActor
+    private func preloadImageIfNeeded() async {
+        guard preloadedImage == nil || preparedShareController == nil else { return }
+        let started = CFAbsoluteTimeGetCurrent()
+        if preloadedImage == nil, let image = await Self.loadDecodedImage() {
+            preloadedImage = image
         }
-
-        guard preparedShareSheet != nil else {
-            Self.log("tap -> no prepared controller available")
-            return
+        if preparedShareController == nil,
+           let controller = await Self.prepareShareController() {
+            preparedShareController = controller
         }
+        Self.logDuration("preload image", since: started)
+    }
 
-        sharePresentationID &+= 1
-        Self.logDuration("tap -> presentation request", since: tapStartedAt)
+    private static func loadDecodedImage() async -> UIImage? {
+        await Task.detached(priority: .userInitiated) {
+            guard
+                let url = Bundle.main.url(forResource: "pnl-card", withExtension: "jpg"),
+                let image = UIImage(contentsOfFile: url.path)
+            else { return nil }
+            // Force-decode now so the share-sheet preview header doesn't lazy
+            // decompress the JPG on the main thread when it appears.
+            return image.preparingForDisplay() ?? image
+        }.value
     }
 
     @MainActor
-    private func warmShareSheetIfNeeded() async {
-        guard preparedShareSheet == nil else { return }
+    private func handleShareTap() {
+        RevealHaptics.shared.playCardPress()
+        let tapStartedAt = CFAbsoluteTimeGetCurrent()
 
-        let warmStartedAt = CFAbsoluteTimeGetCurrent()
-        Self.log("warm start")
-        _ = Self.shareItem
+        if let controller = preparedShareController {
+            Self.presentTopmost(controller, sourceTapAt: tapStartedAt)
+            return
+        }
 
-        let provider = Self.makeJPEGItemProvider(url: Self.shareImageURL)
-        let providerWarmStartedAt = CFAbsoluteTimeGetCurrent()
-        await Self.warmFileRepresentation(provider)
-        Self.logDuration("warm item provider file representation", since: providerWarmStartedAt)
+        Task { @MainActor in
+            if let controller = await Self.prepareShareController() {
+                Self.logDuration("tap -> controller built", since: tapStartedAt)
+                preparedShareController = controller
+                Self.presentTopmost(controller, sourceTapAt: tapStartedAt)
+                return
+            }
 
-        let controllerBuildStartedAt = CFAbsoluteTimeGetCurrent()
-        preparedShareSheet = Self.makePreparedShareSheet(using: provider)
-        Self.logDuration("warm activity controller init", since: controllerBuildStartedAt)
-        Self.logDuration("warm total", since: warmStartedAt)
+            let image: UIImage?
+            if let cached = preloadedImage {
+                image = cached
+            } else {
+                image = await Self.loadDecodedImage()
+            }
+            if let image {
+                preloadedImage = image
+                let fallback = Self.makeFallbackController(with: image)
+                Self.logDuration("tap -> controller built", since: tapStartedAt)
+                Self.presentTopmost(fallback, sourceTapAt: tapStartedAt)
+                return
+            }
+
+            Self.log("share prepare failed")
+        }
     }
 
-    private static func makePreparedShareSheet(
-        using provider: NSItemProvider? = nil
-    ) -> PreparedShareSheet? {
-        let provider = provider ?? makeJPEGItemProvider(url: shareImageURL)
+    @MainActor
+    private static func prepareShareController() async -> UIActivityViewController? {
+        guard let imageURL = Bundle.main.url(forResource: "pnl-card", withExtension: "jpg") else {
+            return nil
+        }
+        let provider = NSItemProvider()
+        provider.suggestedName = "polymarket-position.jpg"
+        provider.registerDataRepresentation(
+            forTypeIdentifier: UTType.jpeg.identifier,
+            visibility: .all
+        ) { completion in
+            do {
+                completion(try Data(contentsOf: imageURL), nil)
+            } catch {
+                completion(nil, error)
+            }
+            return nil
+        }
+        await warmItemProvider(provider)
+
         let controller = UIActivityViewController(
             activityItems: [provider],
             applicationActivities: nil
         )
         controller.completionWithItemsHandler = { _, completed, _, error in
             if let error {
-                log("share completion error: \(error.localizedDescription)")
+                Self.log("share completion error: \(error.localizedDescription)")
             } else {
-                log("share completion completed=\(completed)")
+                Self.log("share completion completed=\(completed)")
             }
         }
-
-        // Force eager UIKit setup while the button is merely visible, not
-        // when the user taps.
-        _ = controller.view
-        return PreparedShareSheet(controller: controller)
+        controller.loadViewIfNeeded()
+        return controller
     }
 
-    private static func makeJPEGItemProvider(url: URL) -> NSItemProvider {
-        let provider = NSItemProvider()
-        provider.suggestedName = "polymarket-position.jpg"
-        provider.registerFileRepresentation(
-            forTypeIdentifier: UTType.jpeg.identifier,
-            fileOptions: [],
-            visibility: .all
-        ) { completion in
-            completion(url, false, nil)
-            return nil
-        }
-        return provider
-    }
-
-    private static func warmFileRepresentation(_ provider: NSItemProvider) async {
+    private static func warmItemProvider(_ provider: NSItemProvider) async {
         await withCheckedContinuation { continuation in
-            provider.loadFileRepresentation(forTypeIdentifier: UTType.jpeg.identifier) { _, error in
-                if let error {
-                    log("warm file representation error: \(error.localizedDescription)")
-                }
+            provider.loadDataRepresentation(forTypeIdentifier: UTType.jpeg.identifier) { _, _ in
                 continuation.resume()
             }
+        }
+    }
+
+    private static func makeFallbackController(with image: UIImage) -> UIActivityViewController {
+        let controller = UIActivityViewController(
+            activityItems: [image],
+            applicationActivities: nil
+        )
+        controller.completionWithItemsHandler = { _, completed, _, error in
+            if let error {
+                Self.log("share completion error: \(error.localizedDescription)")
+            } else {
+                Self.log("share completion completed=\(completed)")
+            }
+        }
+        return controller
+    }
+
+    private static func presentTopmost(
+        _ vc: UIViewController,
+        sourceTapAt tapStartedAt: CFAbsoluteTime
+    ) {
+        let scenes = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+        let activeScene = scenes.first(where: { $0.activationState == .foregroundActive })
+            ?? scenes.first
+        guard
+            let scene = activeScene,
+            let keyWindow = scene.windows.first(where: { $0.isKeyWindow }) ?? scene.windows.first,
+            var top = keyWindow.rootViewController
+        else {
+            log("no presentable window")
+            return
+        }
+        while let presented = top.presentedViewController {
+            top = presented
+        }
+
+        // Popover anchor for iPad / Catalyst — required or `present` throws
+        // on regular-width size classes.
+        if let popover = vc.popoverPresentationController {
+            popover.sourceView = top.view
+            popover.sourceRect = CGRect(
+                x: top.view.bounds.midX,
+                y: top.view.bounds.midY,
+                width: 1,
+                height: 1
+            )
+            popover.permittedArrowDirections = []
+        }
+
+        logDuration("tap -> present(animated:) call", since: tapStartedAt)
+        top.present(vc, animated: true) {
+            logDuration("tap -> share sheet visible", since: tapStartedAt)
         }
     }
 
@@ -273,10 +304,9 @@ struct ShareButtonsRow: View {
     #endif
 }
 
-/// Photo-typed share payload. `FileRepresentation(exportedContentType: .jpeg)`
-/// is the signal iOS uses to decide between the file-row preview and the tall
-/// gallery-style image preview — without it, sharing a bundle URL falls back
-/// to the file-row look.
+/// macOS-only Transferable wrapper. Same `.jpeg` `FileRepresentation` that
+/// makes `ShareLink` render the gallery-style preview header.
+#if os(macOS)
 private struct PnlCardImage: Transferable {
     let url: URL
 
@@ -287,6 +317,7 @@ private struct PnlCardImage: Transferable {
         .suggestedFileName("polymarket-position.jpg")
     }
 }
+#endif
 
 private struct GlassPressStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
@@ -296,63 +327,3 @@ private struct GlassPressStyle: ButtonStyle {
                        value: configuration.isPressed)
     }
 }
-
-#if os(iOS)
-private struct PreparedShareSheet {
-    let controller: UIActivityViewController
-}
-
-private struct PreparedShareSheetPresenter: UIViewControllerRepresentable {
-    let controller: UIActivityViewController?
-    let presentationID: UInt
-    let tapStartedAt: CFAbsoluteTime
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
-    }
-
-    func makeUIViewController(context: Context) -> HostViewController {
-        HostViewController()
-    }
-
-    func updateUIViewController(_ uiViewController: HostViewController, context: Context) {
-        guard presentationID != 0 else { return }
-        guard context.coordinator.lastPresentedID != presentationID else { return }
-        guard let controller else { return }
-        guard uiViewController.presentedViewController == nil else { return }
-
-        context.coordinator.lastPresentedID = presentationID
-        ShareButtonsRow.logDuration("tap -> presenter update", since: tapStartedAt)
-
-        DispatchQueue.main.async {
-            guard uiViewController.presentedViewController == nil else { return }
-            if let popover = controller.popoverPresentationController {
-                popover.sourceView = uiViewController.view
-                popover.sourceRect = CGRect(
-                    x: uiViewController.view.bounds.midX,
-                    y: uiViewController.view.bounds.midY,
-                    width: 1,
-                    height: 1
-                )
-                popover.permittedArrowDirections = []
-            }
-            ShareButtonsRow.logDuration("tap -> present(animated:) call", since: tapStartedAt)
-            uiViewController.present(controller, animated: true) {
-                ShareButtonsRow.logDuration("tap -> share sheet visible", since: tapStartedAt)
-            }
-        }
-    }
-
-    final class Coordinator {
-        var lastPresentedID: UInt = 0
-    }
-
-    final class HostViewController: UIViewController {
-        override func loadView() {
-            view = UIView(frame: .zero)
-            view.isHidden = true
-            view.isUserInteractionEnabled = false
-        }
-    }
-}
-#endif

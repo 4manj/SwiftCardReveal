@@ -23,17 +23,33 @@ vertex FullscreenVertexOut fullscreenVertex(uint vid [[vertex_id]])
 fragment half4 compositeFragment(FullscreenVertexOut in           [[stage_in]],
                                  texture2d<half> particles        [[texture(0)]],
                                  texture2d<half> bloom            [[texture(1)]],
-                                 constant FrameUniforms &u        [[buffer(0)]])
+                                 texture2d<half> cloud            [[texture(2)]],
+                                 texture2d<half> cloudBloom       [[texture(3)]],
+                                 constant FrameUniforms &u        [[buffer(0)]],
+                                 constant CloudUniforms &cloudU   [[buffer(1)]])
 {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
 
-    half4 dust        = particles.sample(s, in.uv);
-    half4 bloomSample = bloom.sample(s, in.uv);
+    half3 dust = particles.sample(s, in.uv).rgb;
+    half3 dustBloom = bloom.sample(s, in.uv).rgb;
+
     half opacity = half(u.dustOpacity);
-    half3 lit = (dust.rgb + bloomSample.rgb * half(u.bloomIntensity)) * opacity;
+    half3 lit = (dust + dustBloom * half(u.bloomIntensity)) * opacity;
+    if (cloudU.opacity > 0.001) {
+        half3 cloudDirect = cloud.sample(s, in.uv).rgb;
+        half3 cloudBlur = cloudBloom.sample(s, in.uv).rgb;
+        lit += cloudDirect + cloudBlur * half(cloudU.bloomIntensity);
+    }
     half3 toned = lit / (lit + half3(0.6h)) * 1.6h;
 
-    return half4(saturate(toned), 1.0h);
+    // Screen-space dither (~±0.5/255) to break up the final 8-bit drawable
+    // quantisation. Without this, large soft gradients band into visible
+    // contour rings even with fp16 intermediate buffers.
+    float ditherHash = fract(sin(dot(in.uv * 1024.0,
+                                     float2(12.9898, 78.233))) * 43758.5453);
+    half dither = half((ditherHash - 0.5) * (1.0 / 255.0));
+
+    return half4(saturate(toned + half3(dither)), 1.0h);
 }
 
 fragment half4 downsampleFragment(FullscreenVertexOut in   [[stage_in]],

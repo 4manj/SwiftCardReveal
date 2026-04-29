@@ -36,6 +36,17 @@ struct FrameUniforms {
     var pad1: Float
 }
 
+struct CloudUniforms {
+    var time: Float
+    var aspect: Float
+    var opacity: Float
+    var bloomIntensity: Float
+    /// 0 = centered single cloud, 1 = fully split into a small top + bottom
+    /// pair with a clear middle. Ramps in just after `opacity` so the cloud
+    /// reads as appearing centered for a moment, then separating.
+    var splitProgress: Float
+}
+
 // MARK: - Tunable parameters
 
 struct SimulationParameters {

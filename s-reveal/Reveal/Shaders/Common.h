@@ -27,7 +27,7 @@ struct FrameUniforms {
     float  idleStrength;
     float  upwardFlowSpeed; // particle-space units / sec
     float  bloomIntensity;
-    float  dustOpacity;     // fades out after reveal so SwiftUI card can take over
+    float  dustOpacity;     // dust visibility — held high through reveal so cloud persists
     float  maskCenterY;     // Y center of the analytic ellipse
     float  maskRadiusX;     // ellipse half-width in particle space
     float  maskRadiusY;     // ellipse half-height in particle space
@@ -37,6 +37,14 @@ struct FrameUniforms {
     float  burstEnvelope;
     float  pad0;
     float  pad1;
+};
+
+struct CloudUniforms {
+    float time;
+    float aspect;
+    float opacity;
+    float bloomIntensity;
+    float splitProgress;     // 0 = centered, 1 = split top/bottom with clear middle
 };
 
 struct ParticleVertexOut {
@@ -72,7 +80,7 @@ struct Petal {
 };
 
 struct PetalUniforms {
-    float2 origin;             // tap location, particle space
+    float2 unusedOrigin;       // reserved; petal spawn comes from Petal.position
     float  elapsed;            // seconds since burst start
     float  dt;
     float  aspect;

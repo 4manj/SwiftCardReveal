@@ -26,22 +26,31 @@ struct SplashView: View {
                                 radius: 60)
                 }
                 .transition(.opacity)
-                .onAppear {
-                    withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
-                        pulse = 1
-                    }
-                }
             }
         }
         .animation(.smooth(duration: 0.55), value: done)
         .onAppear {
+            withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
+                pulse = 1
+            }
+        }
+        .task {
             #if os(iOS)
             // Build + start the Core Haptics engine, cache patterns, prime
             // the actuator. The 2 s splash hides the warm-up so the user's
             // first tap doesn't pay engine cold-start cost.
             RevealHaptics.shared.prewarm()
             #endif
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            // Front-load the Metal pipeline specialization during the splash.
+            // Renderer init still does a non-blocking prewarm, but by the time
+            // the reveal scene appears the process-wide pipeline cache is
+            // usually already hot.
+            Task.detached(priority: .userInitiated) {
+                MetalPipelinePrewarmer.prewarm()
+                _ = PnlCard3DView.bundledCardImage
+            }
+            try? await Task.sleep(for: .seconds(2))
+            await MainActor.run {
                 done = true
             }
         }
