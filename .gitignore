@@ -34,3 +34,7 @@ fastlane/test_output
 
 ## Local Claude Code state
 .claude/
+
+## Internal planning docs (kept locally, not shipped)
+docs/particle-reveal-plan.md
+docs/particle-reveal-execution-plan.md
