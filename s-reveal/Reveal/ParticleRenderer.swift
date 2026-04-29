@@ -383,6 +383,13 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
     /// Set when the user taps, used to drive the post-tap dust fade-out.
     private var revealedAt: CFTimeInterval?
 
+    /// Per-reveal effect toggles, captured at `registerTap`. Defaults true so
+    /// existing callers get the original behaviour. Flip to false (e.g. when
+    /// the P&L is negative) to suppress the cloud or petal effect for the
+    /// current reveal without altering any of the underlying animation code.
+    private var cloudEnabled: Bool = true
+    private var petalsEnabled: Bool = true
+
     /// Weak handle on the MTKView for lifecycle coordination.
     private weak var hostView: MTKView?
 
@@ -948,7 +955,13 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
 
     // MARK: - Public input
 
-    func registerTap(viewLocation: CGPoint, viewSize: CGSize, playHaptics: Bool = true) {
+    func registerTap(viewLocation: CGPoint, viewSize: CGSize,
+                     playHaptics: Bool = true,
+                     cloudEnabled: Bool = true,
+                     petalsEnabled: Bool = true) {
+        self.cloudEnabled = cloudEnabled
+        self.petalsEnabled = petalsEnabled
+
         tapPos = CoordinateSpace.tapToParticleSpace(
             viewLocation: viewLocation,
             viewSize: viewSize,
@@ -956,18 +969,24 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         )
         tapTime = 0
 
-        // Petals always spawn from CARD CENTER (screen center), regardless of
-        // where the user tapped — they should look like they're erupting from
-        // behind the card, not the tap point. Foreground layer XORs in a fixed
-        // mask so its cohort visibly differs from the background layer's.
-        let baseSeed = UInt64(CACurrentMediaTime() * 1_000_000)
-        let seed = isForegroundLayer ? baseSeed ^ 0xCAFE_BABE_DEAD_BEEF : baseSeed
-        let petals = PetalSystem.makePetals(at: .zero, seed: seed, count: petalCount)
-        petalBuffer.contents().copyMemory(
-            from: petals,
-            byteCount: petals.count * MemoryLayout<Petal>.stride
-        )
-        petalStartTime = CACurrentMediaTime()
+        if petalsEnabled {
+            // Petals always spawn from CARD CENTER (screen center), regardless
+            // of where the user tapped — they should look like they're erupting
+            // from behind the card, not the tap point. Foreground layer XORs in
+            // a fixed mask so its cohort visibly differs from the background's.
+            let baseSeed = UInt64(CACurrentMediaTime() * 1_000_000)
+            let seed = isForegroundLayer ? baseSeed ^ 0xCAFE_BABE_DEAD_BEEF : baseSeed
+            let petals = PetalSystem.makePetals(at: .zero, seed: seed, count: petalCount)
+            petalBuffer.contents().copyMemory(
+                from: petals,
+                byteCount: petals.count * MemoryLayout<Petal>.stride
+            )
+            petalStartTime = CACurrentMediaTime()
+        } else {
+            // Effect off: skip petal seeding so `petalActive` stays false; the
+            // simulate kernel + petal render pass are gated on it and won't run.
+            petalStartTime = nil
+        }
         if revealedAt == nil { revealedAt = CACurrentMediaTime() }
         hostView?.isPaused = false
 
@@ -1105,15 +1124,17 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
             : params.bloomIntensity * 1.05
         // Cloud arrives in sync with the SwiftUI card pop (≤ 0.55 s) and is
         // fully visible by 0.35 s — earlier and faster than the old 0.20–0.72
-        // s ramp so the user sees the cloud forming as the card rises.
-        let cloudOpacity: Float = hasTapped
+        // s ramp so the user sees the cloud forming as the card rises. When
+        // `cloudEnabled` is false (e.g. negative P&L), opacity stays at 0 so
+        // the cloud render + bloom passes are skipped entirely.
+        let cloudOpacity: Float = (hasTapped && cloudEnabled)
             ? Self.smoothstep(0.05, 0.35, tapTime)
             : 0
         // Split ramps from 0 (centered cloud) to 1 (small top + small bottom,
         // clear middle). Targets completion at ~1.85 s so the split lands a
         // hair before the share button appears at 2.0 s — the cloud has
         // finished separating by the time the secondary UI arrives.
-        let cloudSplitProgress: Float = hasTapped
+        let cloudSplitProgress: Float = (hasTapped && cloudEnabled)
             ? Self.smoothstep(0.10, 1.85, tapTime)
             : 0
         let cloudBloomIntensity: Float = 1.08 + 0.24 * sin(Float(now - startTime) * 0.62)

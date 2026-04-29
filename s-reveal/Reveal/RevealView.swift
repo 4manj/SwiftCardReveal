@@ -136,6 +136,14 @@ final class RevealOrchestrator: ObservableObject {
     @Published var revealed: Bool = false
     @Published var showButtons: Bool = false
     @Published var showSkip: Bool = false
+
+    /// Whether the bloomed cloud effect plays for the next reveal. Defaults
+    /// true; flip to false (e.g. when the P&L is negative) to suppress it.
+    @Published var cloudEnabled: Bool = true
+    /// Whether petal confetti plays for the next reveal. Independent of
+    /// `cloudEnabled` so callers can mix-and-match if needed.
+    @Published var petalsEnabled: Bool = true
+
     weak var renderer: ParticleRenderer?       // strongly held by RevealCoordinator
     /// Optional second renderer that draws a petal cohort *in front* of the
     /// SwiftUI card. Same simulation, different seed, transparent drawable.
@@ -150,6 +158,14 @@ final class RevealOrchestrator: ObservableObject {
 
     func handleTap(at viewLocation: CGPoint, in viewSize: CGSize) {
         triggerReveal(at: viewLocation, in: viewSize)
+    }
+
+    /// Convenience for the common case: positive P&L gets the full celebratory
+    /// cloud + petal confetti, negative P&L stays subdued (both effects off).
+    /// Call this from wherever the P&L sign is known *before* the reveal fires.
+    func setEffectsForPnL(isPositive: Bool) {
+        cloudEnabled = isPositive
+        petalsEnabled = isPositive
     }
 
     /// Fired by the 5-second countdown in `RevealView.task`. Synthesizes a
@@ -168,13 +184,21 @@ final class RevealOrchestrator: ObservableObject {
         guard !revealed, !renderer.isAnimatingPetals else { return }
         cancelPendingRevealTasks()
 
-        renderer.registerTap(viewLocation: viewLocation, viewSize: viewSize)
+        renderer.registerTap(
+            viewLocation: viewLocation,
+            viewSize: viewSize,
+            cloudEnabled: cloudEnabled,
+            petalsEnabled: petalsEnabled
+        )
         // Foreground layer fires a second cohort with haptics suppressed —
-        // only one playReveal arc per tap.
+        // only one playReveal arc per tap. Cloud is always disabled here
+        // since the foreground renderer skips the cloud pass anyway.
         foregroundRenderer?.registerTap(
             viewLocation: viewLocation,
             viewSize: viewSize,
-            playHaptics: false
+            playHaptics: false,
+            cloudEnabled: false,
+            petalsEnabled: petalsEnabled
         )
 
         withAnimation(.bouncy(duration: 0.55, extraBounce: 0.12)) {
