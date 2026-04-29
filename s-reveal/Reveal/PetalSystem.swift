@@ -25,8 +25,6 @@ struct Petal {
 }
 
 struct PetalUniforms {
-    /// Reserved for shader compatibility; petal spawn is driven by `Petal.position`.
-    var _unusedOrigin: SIMD2<Float>
     var elapsed: Float
     var dt: Float
     var aspect: Float

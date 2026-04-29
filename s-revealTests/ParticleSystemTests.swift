@@ -91,11 +91,34 @@ struct ParticleSystemTests {
     @Test
     func frameUniformsStrideMatchesShader() {
         let stride = MemoryLayout<FrameUniforms>.stride
-        #expect(stride == 80)
+        #expect(stride == 60)
     }
 
     @Test
     func cloudUniformsStrideMatchesShader() {
         #expect(MemoryLayout<CloudUniforms>.stride == 20)
+    }
+
+    @Test
+    func dtClampedAfterLongStall() {
+        let dt = FrameTiming.clampedDt(now: 100.0, last: 99.0)
+        #expect(dt == FrameTiming.maxDt)
+    }
+
+    @Test
+    func dtFallsThroughWhenSmall() {
+        let dt = FrameTiming.clampedDt(now: 100.0, last: 99.984)
+        #expect(abs(dt - 0.016) < 1e-3)
+    }
+
+    @Test
+    func dtNilLastDefaultsTo60Hz() {
+        let dt = FrameTiming.clampedDt(now: 100.0, last: nil)
+        #expect(abs(dt - (1.0 / 60.0)) < 1e-6)
+    }
+
+    @Test
+    func petalUniformsStrideMatchesShader() {
+        #expect(MemoryLayout<PetalUniforms>.stride == 40)
     }
 }

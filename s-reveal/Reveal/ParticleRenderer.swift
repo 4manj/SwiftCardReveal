@@ -377,7 +377,6 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
     private var startTime: CFTimeInterval = CACurrentMediaTime()
     private var lastFrameTime: CFTimeInterval?
 
-    private var tapPos: SIMD2<Float> = .zero
     private var tapTime: Float = 100   // huge value = no recent tap
 
     /// Set when the user taps, used to drive the post-tap dust fade-out.
@@ -448,13 +447,13 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         // ever fails, the GPU is reading garbage.
         assert(MemoryLayout<Particle>.stride == 32,
                "Particle stride changed; update Common.h to match.")
-        assert(MemoryLayout<FrameUniforms>.stride == 80,
+        assert(MemoryLayout<FrameUniforms>.stride == 60,
                "FrameUniforms stride changed; update Common.h to match.")
         assert(MemoryLayout<CloudUniforms>.stride == 20,
                "CloudUniforms stride changed; update Common.h to match.")
         assert(MemoryLayout<Petal>.stride == 56,
                "Petal stride changed; update Common.h to match.")
-        assert(MemoryLayout<PetalUniforms>.stride == 48,
+        assert(MemoryLayout<PetalUniforms>.stride == 40,
                "PetalUniforms stride changed; update Common.h to match.")
     }
 
@@ -624,7 +623,7 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         if let rasterized = MaskShape.rasterize(size: 512) {
             cgImage = rasterized
         } else {
-            print("[ParticleRenderer] Failed to rasterize mask-shape.svg path; falling back to procedural circle mask.")
+            print("[ParticleRenderer] Failed to rasterize embedded mask-shape path; falling back to procedural circle mask.")
             guard let fallback = MaskShape.rasterizeFallbackCircle(size: 512) else {
                 throw RendererError.artGenerationFailed
             }
@@ -714,7 +713,6 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         cb.label = "RendererPrewarm"
 
         let warmUniforms = FrameUniforms(
-            tapPos: .zero,
             time: 0,
             dt: 1.0 / 60.0,
             aspect: 1,
@@ -729,9 +727,7 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
             maskFeather: 0.42,
             edgeGlowStrength: 0,
             tapTime: 0.25,
-            burstEnvelope: 0.8,
-            pad0: 0,
-            pad1: 0
+            burstEnvelope: 0.8
         )
         warmUniformBuffer.contents().copyMemory(
             from: [warmUniforms],
@@ -756,7 +752,6 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
             byteCount: warmPetals.count * MemoryLayout<Petal>.stride
         )
         let warmPetalUniforms = PetalUniforms(
-            _unusedOrigin: .zero,
             elapsed: 0.3,
             dt: 1.0 / 60.0,
             aspect: 1,
@@ -962,11 +957,6 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         self.cloudEnabled = cloudEnabled
         self.petalsEnabled = petalsEnabled
 
-        tapPos = CoordinateSpace.tapToParticleSpace(
-            viewLocation: viewLocation,
-            viewSize: viewSize,
-            aspect: aspect
-        )
         tapTime = 0
 
         if petalsEnabled {
@@ -1143,7 +1133,6 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
         let cloudBloomIntensity: Float = 1.08 + 0.24 * sin(Float(now - startTime) * 0.62)
 
         let uniforms = FrameUniforms(
-            tapPos:         tapPos,
             time:           Float(now - startTime),
             dt:             dt,
             aspect:         aspect,
@@ -1158,9 +1147,7 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
             maskFeather:    0.42,
             edgeGlowStrength: edgeGlowStrength,
             tapTime:        tapTime,
-            burstEnvelope:  burstEnvelope,
-            pad0:           0,
-            pad1:           0
+            burstEnvelope:  burstEnvelope
         )
         uniformBuffer.contents().copyMemory(
             from: [uniforms],
@@ -1263,7 +1250,6 @@ final class ParticleRenderer: NSObject, MTKViewDelegate {
             // dt so per-second damping rescales consistently.
             let petalDt = dt * PetalSystem.timeScale
             let petalUniforms = PetalUniforms(
-                _unusedOrigin:    tapPos,
                 elapsed:          petalElapsed * PetalSystem.timeScale,
                 dt:               petalDt,
                 aspect:           aspect,
@@ -1484,7 +1470,6 @@ enum MetalPipelinePrewarmer {
             byteCount: particles.count * MemoryLayout<Particle>.stride
         )
         let frameUniforms = FrameUniforms(
-            tapPos: .zero,
             time: 0,
             dt: 1.0 / 60.0,
             aspect: 1,
@@ -1499,9 +1484,7 @@ enum MetalPipelinePrewarmer {
             maskFeather: 0.42,
             edgeGlowStrength: 0,
             tapTime: 0.25,
-            burstEnvelope: 0.8,
-            pad0: 0,
-            pad1: 0
+            burstEnvelope: 0.8
         )
         uniformBuffer.contents().copyMemory(
             from: [frameUniforms],
@@ -1524,7 +1507,6 @@ enum MetalPipelinePrewarmer {
             byteCount: petals.count * MemoryLayout<Petal>.stride
         )
         let petalUniforms = PetalUniforms(
-            _unusedOrigin: .zero,
             elapsed: 0.3,
             dt: 1.0 / 60.0,
             aspect: 1,

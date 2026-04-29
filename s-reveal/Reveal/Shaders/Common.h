@@ -19,7 +19,6 @@ struct Particle {
 };
 
 struct FrameUniforms {
-    float2 tapPos;          // most recent tap, particle space
     float  time;            // seconds since renderer start
     float  dt;              // clamped frame delta in seconds
     float  aspect;          // drawableWidth / drawableHeight
@@ -35,8 +34,6 @@ struct FrameUniforms {
     float  edgeGlowStrength;
     float  tapTime;
     float  burstEnvelope;
-    float  pad0;
-    float  pad1;
 };
 
 struct CloudUniforms {
@@ -80,7 +77,6 @@ struct Petal {
 };
 
 struct PetalUniforms {
-    float2 unusedOrigin;       // reserved; petal spawn comes from Petal.position
     float  elapsed;            // seconds since burst start
     float  dt;
     float  aspect;
@@ -133,18 +129,6 @@ inline float2 sr_curlNoise(float2 p) {
     float dny = (n3 - n4) / (2.0 * eps);
     // 90° rotation of gradient => divergence-free flow.
     return float2(dny, -dnx);
-}
-
-inline float sr_maskWobble(float2 m, float time) {
-    float angle = atan2(m.y, m.x);
-    float n1 = sr_gradNoise(float2(angle * 1.6, time * 0.45));
-    float n2 = sr_gradNoise(float2(angle * 4.2 + 11.3, time * 0.85)) * 0.45;
-    return (n1 + n2) * 0.18;
-}
-
-inline float sr_maskBoundary(float2 m, float time, float maskFeather) {
-    float r = length(m) + sr_maskWobble(m, time);
-    return 1.0 - smoothstep(1.0 - maskFeather, 1.0 + maskFeather, r);
 }
 
 inline float2 sr_maskShapeUV(float2 m, float time) {

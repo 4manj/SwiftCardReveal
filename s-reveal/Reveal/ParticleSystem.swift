@@ -16,7 +16,6 @@ struct Particle {
 }
 
 struct FrameUniforms {
-    var tapPos: SIMD2<Float>
     var time: Float
     var dt: Float
     var aspect: Float
@@ -32,8 +31,6 @@ struct FrameUniforms {
     var edgeGlowStrength: Float
     var tapTime: Float
     var burstEnvelope: Float
-    var pad0: Float
-    var pad1: Float
 }
 
 struct CloudUniforms {
@@ -129,26 +126,6 @@ enum ParticleSystem {
             out.append(particle)
         }
         return out
-    }
-}
-
-// MARK: - View ↔ particle space conversion
-//
-// The renderer uses particle space: x ∈ [-aspect, aspect], y ∈ [-1, 1],
-// with +y pointing up. View space has top-left origin and +y pointing down.
-
-enum CoordinateSpace {
-    /// Converts a tap location (UIKit/AppKit-flipped, top-left origin) in points
-    /// into particle space. `aspect = drawableWidth / drawableHeight`.
-    static func tapToParticleSpace(viewLocation: CGPoint,
-                                   viewSize: CGSize,
-                                   aspect: Float) -> SIMD2<Float> {
-        guard viewSize.width > 0, viewSize.height > 0 else {
-            return .zero
-        }
-        let nx = Float(viewLocation.x / viewSize.width) * 2.0 - 1.0
-        let ny = -(Float(viewLocation.y / viewSize.height) * 2.0 - 1.0)
-        return SIMD2(nx * max(aspect, 0.001), ny)
     }
 }
 
